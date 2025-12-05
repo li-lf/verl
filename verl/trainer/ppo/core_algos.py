@@ -20,6 +20,8 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import json
+import os
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -1028,6 +1030,8 @@ def compute_policy_loss_gspo(
 
     pg_losses1 = -advantages * seq_importance_ratio
     pg_losses2 = -advantages * torch.clamp(seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    clipped_token_mask = (pg_losses2 > pg_losses1) & response_mask.bool()
+    clipped_seq_mask = clipped_token_mask.any(dim=-1)
     pg_losses = torch.maximum(pg_losses1, pg_losses2)
 
     # Apply rollout correction weights if provided
@@ -1040,14 +1044,56 @@ def compute_policy_loss_gspo(
     # For compatibility, return zero for pg_clipfrac_lower (not used in standard GSPO)
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
     pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+    clipped_seq_fraction = clipped_seq_mask.float().mean()
+    if config.log_gspo_clipped_samples and clipped_seq_mask.any():
+        seq_ratios = torch.exp(torch.clamp(negative_approx_kl_seq, min=-20.0, max=20.0))
+        _log_gspo_clipped_sequences(
+            clipped_seq_mask=clipped_seq_mask,
+            seq_importance_ratio=seq_ratios,
+            advantages=advantages,
+            response_mask=response_mask,
+            log_path=config.log_gspo_clipped_samples_path,
+        )
 
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
     pg_metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "actor/gspo_clip_seq_fraction": clipped_seq_fraction.detach().item(),
     }
     return pg_loss, pg_metrics
+
+
+def _log_gspo_clipped_sequences(
+    clipped_seq_mask: torch.Tensor,
+    seq_importance_ratio: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    log_path: Optional[str] = None,
+) -> None:
+    """Log GSPO clipped sequences to a JSONL file."""
+    clipped_indices = torch.nonzero(clipped_seq_mask, as_tuple=False).view(-1)
+    if clipped_indices.numel() == 0:
+        return
+
+    seq_adv_mean = verl_F.masked_mean(advantages, response_mask, axis=-1)
+
+    entries = []
+    for idx in clipped_indices.cpu().tolist():
+        entries.append(
+            {
+                "index": int(idx),
+                "seq_importance_ratio": float(seq_importance_ratio[idx].detach().cpu().item()),
+                "adv_mean": float(seq_adv_mean[idx].detach().cpu().item()),
+            }
+        )
+
+    path = log_path or os.path.join(os.getcwd(), "gspo_clipped_sequences.jsonl")
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        for row in entries:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 @register_policy_loss("gpg")
@@ -1625,7 +1671,8 @@ def compute_policy_loss_with_rollout_correction(
 
     """
     # Import rollout correction helper
-    from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_rejection_mask
+    from verl.trainer.ppo.rollout_corr_helper import \
+        compute_rollout_correction_and_rejection_mask
 
     # Compute IS weights and rejection mask on-the-fly
     # Use no_grad since weights are detached inside and metrics don't need gradients

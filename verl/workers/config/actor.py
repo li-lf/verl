@@ -112,6 +112,8 @@ class ActorConfig(BaseConfig):
     kl_loss_type: str = "low_var_kl"
     ppo_epochs: int = 1
     shuffle: bool = False
+    log_gspo_clipped_samples: bool = False
+    log_gspo_clipped_samples_path: Optional[str] = None
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     use_fused_kernels: bool = False
